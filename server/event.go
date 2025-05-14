@@ -2,15 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"sync"
+	"time"
+
 	sq "github.com/Masterminds/squirrel"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/jmoiron/sqlx"
 	"github.com/mattermost/mattermost-server/v6/model"
 	"github.com/teambition/rrule-go"
-	"net/http"
-	"sync"
-	"time"
 )
 
 func (p *Plugin) GetUserTeams(userId string) ([]string, *model.AppError) {
@@ -296,6 +297,7 @@ func (p *Plugin) GetEvent(w http.ResponseWriter, r *http.Request) {
 			"ce.alert",
 			"ce.alert_time",
 			"cm.member",
+			"cm.accepted",
 		).
 		From("calendar_events ce").
 		LeftJoin("calendar_members cm ON ce.id = cm.event").
@@ -312,13 +314,14 @@ func (p *Plugin) GetEvent(w http.ResponseWriter, r *http.Request) {
 		errorResponse(w, EventNotFound)
 		return
 	}
-
 	type EventFromDb struct {
 		Event
-		User *string `json:"user" db:"member"`
+		User     *string `json:"user" db:"member"`
+		Accepted *bool   `json:"accepted" db:"accepted"`
 	}
 
 	var members []string
+	var acceptedMembers []string
 	var eventDb EventFromDb
 
 	for rows.Next() {
@@ -331,15 +334,16 @@ func (p *Plugin) GetEvent(w http.ResponseWriter, r *http.Request) {
 
 		if eventDb.User != nil {
 			members = append(members, *eventDb.User)
+			if eventDb.Accepted != nil && *eventDb.Accepted {
+				acceptedMembers = append(acceptedMembers, *eventDb.User)
+			}
 		}
-
 	}
 
 	if eventDb.Id == "" {
 		errorResponse(w, EventNotFound)
 		return
 	}
-
 	event := Event{
 		Id:          eventDb.Id,
 		Title:       eventDb.Title,
@@ -359,13 +363,17 @@ func (p *Plugin) GetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userLoc := p.GetUserLocation(user)
-
 	event.Start = event.Start.In(userLoc)
 	event.End = event.End.In(userLoc)
 
-	apiResponse(w, &event)
-	return
+	// Add acceptedMembers to the response
+	response := map[string]interface{}{
+		"event":    event,
+		"accepted": acceptedMembers,
+	}
 
+	apiResponse(w, response)
+	return
 }
 
 func (p *Plugin) GetEvents(w http.ResponseWriter, r *http.Request) {
@@ -644,6 +652,36 @@ func (p *Plugin) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Permission check: Only allow the event owner or a team/system admin to update
+	// Fetch the event from DB to get the owner
+	var dbOwner string
+	queryBuilder := sq.Select("owner", "team").From("calendar_events").Where(sq.Eq{"id": event.Id}).PlaceholderFormat(p.GetDBPlaceholderFormat())
+	querySql, args, errSql := queryBuilder.ToSql()
+	if errSql != nil {
+		p.API.LogError(errSql.Error())
+		errorResponse(w, CantUpdateEvent)
+		return
+	}
+	row := p.DB.QueryRowx(querySql, args...)
+	var teamId string
+	if errScan := row.Scan(&dbOwner, &teamId); errScan != nil {
+		p.API.LogError(errScan.Error())
+		errorResponse(w, EventNotFound)
+		return
+	}
+	isSysAdmin := p.API.HasPermissionTo(session.UserId, model.PermissionSysconsoleReadUserManagementUsers)
+	isTeamAdmin := false
+	if teamId != "" {
+		member, errTeam := p.API.GetTeamMember(teamId, session.UserId)
+		if errTeam == nil && member.SchemeAdmin {
+			isTeamAdmin = true
+		}
+	}
+	if user.Id != dbOwner && !isSysAdmin && !isTeamAdmin {
+		errorResponse(w, NotAuthorizedError)
+		return
+	}
+
 	if event.Visibility == VisibilityChannel && event.Channel == nil {
 		p.API.LogError("Channel is required for channel visibility")
 		errorResponse(w, CantUpdateEvent)
@@ -779,5 +817,196 @@ func (p *Plugin) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	apiResponse(w, &event)
+	return
+}
+
+// Add handler to mark/unmark interest
+func (p *Plugin) ToggleInterested(w http.ResponseWriter, r *http.Request) {
+	pluginContext := p.FromContext(r.Context())
+	session, err := p.API.GetSession(pluginContext.SessionId)
+	if err != nil {
+		p.API.LogError("can't get session")
+		errorResponse(w, NotAuthorizedError)
+		return
+	}
+	user, err := p.API.GetUser(session.UserId)
+	if err != nil {
+		p.API.LogError("can't get user")
+		errorResponse(w, UserNotFound)
+		return
+	}
+	query := mux.Vars(r)
+	eventId := query["eventId"]
+	if eventId == "" {
+		errorResponse(w, InvalidRequestParams)
+		return
+	}
+	// Check if already interested
+	queryBuilder := sq.Select("interested").From("calendar_members").Where(sq.Eq{"event": eventId, "member": user.Id}).PlaceholderFormat(p.GetDBPlaceholderFormat())
+	querySql, args, errSql := queryBuilder.ToSql()
+	if errSql != nil {
+		p.API.LogError(errSql.Error())
+		errorResponse(w, SomethingWentWrong)
+		return
+	}
+	row := p.DB.QueryRowx(querySql, args...)
+	var interested bool
+	errScan := row.Scan(&interested)
+	if errScan != nil {
+		// Not found, insert new row
+		insertBuilder := sq.Insert("calendar_members").Columns("event", "member", "interested").Values(eventId, user.Id, true).PlaceholderFormat(p.GetDBPlaceholderFormat())
+		insertSql, insertArgs, errInsert := insertBuilder.ToSql()
+		if errInsert != nil {
+			p.API.LogError(errInsert.Error())
+			errorResponse(w, SomethingWentWrong)
+			return
+		}
+		_, errInsertExec := p.DB.Queryx(insertSql, insertArgs...)
+		if errInsertExec != nil {
+			p.API.LogError(errInsertExec.Error())
+			errorResponse(w, SomethingWentWrong)
+			return
+		}
+		apiResponse(w, map[string]interface{}{"interested": true})
+		return
+	}
+	// If found, toggle
+	updateBuilder := sq.Update("calendar_members").Set("interested", !interested).Where(sq.Eq{"event": eventId, "member": user.Id}).PlaceholderFormat(p.GetDBPlaceholderFormat())
+	updateSql, updateArgs, errUpdate := updateBuilder.ToSql()
+	if errUpdate != nil {
+		p.API.LogError(errUpdate.Error())
+		errorResponse(w, SomethingWentWrong)
+		return
+	}
+	_, errUpdateExec := p.DB.Queryx(updateSql, updateArgs...)
+	if errUpdateExec != nil {
+		p.API.LogError(errUpdateExec.Error())
+		errorResponse(w, SomethingWentWrong)
+		return
+	}
+	apiResponse(w, map[string]interface{}{"interested": !interested})
+	return
+}
+
+// Add handler to get interest status
+func (p *Plugin) GetInterestedStatus(w http.ResponseWriter, r *http.Request) {
+	pluginContext := p.FromContext(r.Context())
+	session, err := p.API.GetSession(pluginContext.SessionId)
+	if err != nil {
+		p.API.LogError("can't get session")
+		errorResponse(w, NotAuthorizedError)
+		return
+	}
+	user, err := p.API.GetUser(session.UserId)
+	if err != nil {
+		p.API.LogError("can't get user")
+		errorResponse(w, UserNotFound)
+		return
+	}
+	query := mux.Vars(r)
+	eventId := query["eventId"]
+	if eventId == "" {
+		errorResponse(w, InvalidRequestParams)
+		return
+	}
+	queryBuilder := sq.Select("interested").From("calendar_members").Where(sq.Eq{"event": eventId, "member": user.Id}).PlaceholderFormat(p.GetDBPlaceholderFormat())
+	querySql, args, errSql := queryBuilder.ToSql()
+	if errSql != nil {
+		p.API.LogError(errSql.Error())
+		errorResponse(w, SomethingWentWrong)
+		return
+	}
+	row := p.DB.QueryRowx(querySql, args...)
+	var interested bool
+	errScan := row.Scan(&interested)
+	if errScan != nil {
+		apiResponse(w, map[string]interface{}{"interested": false})
+		return
+	}
+	apiResponse(w, map[string]interface{}{"interested": interested})
+	return
+}
+
+// Set a user's notification setting for an event
+func (p *Plugin) SetNotificationSetting(w http.ResponseWriter, r *http.Request) {
+	pluginContext := p.FromContext(r.Context())
+	session, err := p.API.GetSession(pluginContext.SessionId)
+	if err != nil {
+		p.API.LogError("can't get session")
+		errorResponse(w, NotAuthorizedError)
+		return
+	}
+	user, err := p.API.GetUser(session.UserId)
+	if err != nil {
+		p.API.LogError("can't get user")
+		errorResponse(w, UserNotFound)
+		return
+	}
+	query := mux.Vars(r)
+	eventId := query["eventId"]
+	if eventId == "" {
+		errorResponse(w, InvalidRequestParams)
+		return
+	}
+	var req struct {
+		NotificationSetting string `json:"notification_setting"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		errorResponse(w, InvalidRequestParams)
+		return
+	}
+	updateBuilder := sq.Update("calendar_members").Set("notification_setting", req.NotificationSetting).Where(sq.Eq{"event": eventId, "member": user.Id}).PlaceholderFormat(p.GetDBPlaceholderFormat())
+	updateSql, updateArgs, errSql := updateBuilder.ToSql()
+	if errSql != nil {
+		p.API.LogError(errSql.Error())
+		errorResponse(w, SomethingWentWrong)
+		return
+	}
+	_, errUpdate := p.DB.Queryx(updateSql, updateArgs...)
+	if errUpdate != nil {
+		p.API.LogError(errUpdate.Error())
+		errorResponse(w, SomethingWentWrong)
+		return
+	}
+	apiResponse(w, map[string]interface{}{"success": true})
+	return
+}
+
+// Get a user's notification setting for an event
+func (p *Plugin) GetNotificationSetting(w http.ResponseWriter, r *http.Request) {
+	pluginContext := p.FromContext(r.Context())
+	session, err := p.API.GetSession(pluginContext.SessionId)
+	if err != nil {
+		p.API.LogError("can't get session")
+		errorResponse(w, NotAuthorizedError)
+		return
+	}
+	user, err := p.API.GetUser(session.UserId)
+	if err != nil {
+		p.API.LogError("can't get user")
+		errorResponse(w, UserNotFound)
+		return
+	}
+	query := mux.Vars(r)
+	eventId := query["eventId"]
+	if eventId == "" {
+		errorResponse(w, InvalidRequestParams)
+		return
+	}
+	queryBuilder := sq.Select("notification_setting").From("calendar_members").Where(sq.Eq{"event": eventId, "member": user.Id}).PlaceholderFormat(p.GetDBPlaceholderFormat())
+	querySql, args, errSql := queryBuilder.ToSql()
+	if errSql != nil {
+		p.API.LogError(errSql.Error())
+		errorResponse(w, SomethingWentWrong)
+		return
+	}
+	row := p.DB.QueryRowx(querySql, args...)
+	var notificationSetting *string
+	errScan := row.Scan(&notificationSetting)
+	if errScan != nil {
+		apiResponse(w, map[string]interface{}{"notification_setting": nil})
+		return
+	}
+	apiResponse(w, map[string]interface{}{"notification_setting": notificationSetting})
 	return
 }

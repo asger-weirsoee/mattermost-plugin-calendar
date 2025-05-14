@@ -1,8 +1,9 @@
 package main
 
 import (
-	"github.com/gorilla/mux"
 	"net/http"
+
+	"github.com/gorilla/mux"
 )
 
 func (p *Plugin) InitAPI() *mux.Router {
@@ -17,6 +18,12 @@ func (p *Plugin) InitAPI() *mux.Router {
 	r.HandleFunc("/settings", p.UpdateSettings).Methods("PUT")
 
 	r.HandleFunc("/schedule", p.GetSchedule).Methods("GET")
+
+	r.HandleFunc("/events/{eventId}/interested", p.ToggleInterested).Methods("POST")
+	r.HandleFunc("/events/{eventId}/interested", p.GetInterestedStatus).Methods("GET")
+
+	r.HandleFunc("/events/{eventId}/notification_setting", p.SetNotificationSetting).Methods("POST")
+	r.HandleFunc("/events/{eventId}/notification_setting", p.GetNotificationSetting).Methods("GET")
 
 	// 404 handler
 	r.Handle("{anything:.*}", http.NotFoundHandler())

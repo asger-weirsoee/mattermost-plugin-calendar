@@ -1,0 +1,1 @@
+ALTER TABLE calendar_members ADD COLUMN notification_setting VARCHAR(32) DEFAULT NULL; 

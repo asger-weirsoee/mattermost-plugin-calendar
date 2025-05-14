@@ -149,3 +149,11 @@ type UserSettings struct {
 	BusinessDays          []int  `json:"businessDays"`
 	HideNonWorkingDays    bool   `json:"hideNonWorkingDays" db:"hide_non_working_days"`
 }
+
+type CalendarMember struct {
+	Event               string  `json:"event" db:"event"`
+	Member              string  `json:"member" db:"member"`
+	Accepted            bool    `json:"accepted" db:"accepted"`
+	Interested          bool    `json:"interested" db:"interested"`
+	NotificationSetting *string `json:"notification_setting,omitempty" db:"notification_setting"`
+}

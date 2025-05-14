@@ -6,7 +6,7 @@ import { Channel } from 'mattermost-redux/types/channels';
 import { useDispatch, useSelector } from 'react-redux';
 
 import { getCurrentTeamId, getCurrentTeam } from 'mattermost-redux/selectors/entities/teams';
-import { getUserStatuses, makeGetProfilesInChannel } from 'mattermost-redux/selectors/entities/users';
+import { getUserStatuses, makeGetProfilesInChannel, getCurrentUser } from 'mattermost-redux/selectors/entities/users';
 import { getTeammateNameDisplaySetting } from 'mattermost-redux/selectors/entities/preferences';
 import { getProfilesInChannel } from 'mattermost-redux/actions/users';
 
@@ -62,6 +62,7 @@ import { GlobalState } from 'mattermost-redux/types/store';
 import { closeEventModal, eventSelected, updateMembersAddedInEvent, updateSelectedEventTime } from 'actions';
 import { getMembersAddedInEvent, getSelectedEventTime, selectIsOpenEventModal, selectSelectedEvent } from 'selectors';
 import { ApiClient } from 'client';
+import type { EventApiResponse } from 'client';
 
 import RepeatEventCustom from './repeat-event';
 
@@ -163,6 +164,26 @@ const EventModalComponent = () => {
 
     const toasterId = useId("toasterEventForm");
     const { dispatchToast } = useToastController(toasterId);
+
+    const currentUser = useSelector(getCurrentUser);
+    const [canEdit, setCanEdit] = useState(true);
+    const [isInterested, setIsInterested] = useState(false);
+
+    const [acceptedUsers, setAcceptedUsers] = useState<UserProfile[]>([]);
+
+    const notificationOptions = [
+        { value: '', label: 'None' },
+        { value: '5_minutes_before', label: '5 minutes before' },
+        { value: '15_minutes_before', label: '15 minutes before' },
+        { value: '30_minutes_before', label: '30 minutes before' },
+        { value: '1_hour_before', label: '1 hour before' },
+        { value: '2_hours_before', label: '2 hours before' },
+        { value: '1_day_before', label: '1 day before' },
+        { value: '2_days_before', label: '2 days before' },
+        { value: '1_week_before', label: '1 week before' },
+    ];
+    const [notificationSetting, setNotificationSetting] = useState<string>('');
+    const [notificationSaving, setNotificationSaving] = useState<boolean>(false);
 
     // methods
     const viewEventModalHandleClose = () => {
@@ -330,37 +351,61 @@ const EventModalComponent = () => {
         let mounted = true;
         if (mounted && selectedEvent?.event?.id != null) {
             setIsLoading(true);
-            ApiClient.getEventById(selectedEvent.event.id).then((data) => {
-                setTitleEvent(data.data.title);
-                setDescriptionEvent(data.data.description);
+            ApiClient.getEventById(selectedEvent.event.id).then(async (data: { data: EventApiResponse }) => {
+                setTitleEvent(data.data.event.title);
+                setDescriptionEvent(data.data.event.description);
 
-                const startEventResp: Date = parse(data.data.start, "yyyy-MM-dd'T'HH:mm:ssxxx", new Date());
-                const endEventResp: Date = parse(data.data.end, "yyyy-MM-dd'T'HH:mm:ssxxx", new Date());
+                const startEventResp: Date = parse(data.data.event.start, "yyyy-MM-dd'T'HH:mm:ssxxx", new Date());
+                const endEventResp: Date = parse(data.data.event.end, "yyyy-MM-dd'T'HH:mm:ssxxx", new Date());
                 dispatch(updateSelectedEventTime({
                     start: startEventResp,
                     end: endEventResp,
                     startTime: format(startEventResp, 'HH:mm'),
                     endTime: format(endEventResp, 'HH:mm'),
                 }));
-                dispatch(updateMembersAddedInEvent(data.data.attendees));
+                dispatch(updateMembersAddedInEvent(data.data.event.attendees));
 
-                setSelectedColor(data.data.color!);
-                setSelectedColorStyle(colorsMap[data.data.color!]);
-                setSelectedVisibility(data.data.visibility);
-                setSelectedAlert(data.data.alert);
+                setSelectedColor(data.data.event.color!);
+                setSelectedColorStyle(colorsMap[data.data.event.color!]);
+                setSelectedVisibility(data.data.event.visibility);
+                setSelectedAlert(data.data.event.alert);
 
-                if (data.data.recurrence.length !== 0) {
-                    setRepeatRule(data.data.recurrence);
+                if (data.data.event.recurrence.length !== 0) {
+                    setRepeatRule(data.data.event.recurrence);
                     setRepeatOption('Custom');
                     setShowCustomRepeat(true);
                 }
 
-                if (data.data.channel != null) {
-                    Client4.getChannel(data.data.channel).then((channel: Channel) => {
+                if (data.data.event.channel != null) {
+                    Client4.getChannel(data.data.event.channel).then((channel: Channel) => {
                         setSelectedChannel(channel);
                         setSelectedChannelText(channel.display_name);
                     });
                 }
+
+                // Permission logic: allow edit if current user is owner, system admin, or team admin
+                const isOwner = currentUser?.id === data.data.event.owner;
+                const isSysAdmin = currentUser?.roles?.includes('system_admin');
+                const isTeamAdmin = currentUser?.roles?.includes('team_admin') || (data.data.event.team && currentUser?.roles?.includes(`team_admin:${data.data.event.team}`));
+                setCanEdit(isOwner || isSysAdmin || isTeamAdmin);
+                // Fetch interest status
+                fetch(`/plugins/calendar/events/${selectedEvent.event.id}/interested`, { method: 'GET', credentials: 'same-origin' })
+                    .then(res => res.json())
+                    .then(res => {
+                        if (res.data && typeof res.data.interested === 'boolean') {
+                            setIsInterested(res.data.interested);
+                        }
+                    });
+                // Fetch accepted users' profiles
+                if (data.data.accepted && data.data.accepted.length > 0) {
+                    const users = await ApiClient.getUsersByIds(data.data.accepted);
+                    setAcceptedUsers(users);
+                } else {
+                    setAcceptedUsers([]);
+                }
+                // Fetch notification setting for this user/event
+                const notif = await ApiClient.getNotificationSetting(selectedEvent.event.id);
+                setNotificationSetting(notif || '');
                 setIsLoading(false);
             });
         } else if (mounted && selectedEvent?.event?.id == null && selectedEvent?.event?.start != null) {
@@ -372,7 +417,7 @@ const EventModalComponent = () => {
             }));
         }
         mounted = false;
-    }, [selectedEvent]);
+    }, [selectedEvent, currentUser]);
 
     const getDisplayUserName = (user: UserProfile) => {
         if (displayNameSettings === 'full_name') {
@@ -462,6 +507,45 @@ const EventModalComponent = () => {
             );
         }
         return <></>;
+    };
+
+    const onToggleInterested = async () => {
+        if (!selectedEvent?.event?.id) return;
+        const res = await fetch(`/plugins/calendar/events/${selectedEvent.event.id}/interested`, { method: 'POST', credentials: 'same-origin' });
+        const data = await res.json();
+        if (data && typeof data.data?.interested === 'boolean') {
+            setIsInterested(data.data.interested);
+        }
+    };
+
+    // Render accepted users' avatars
+    const renderAcceptedAvatars = () => {
+        if (!acceptedUsers || acceptedUsers.length === 0) {
+            return null;
+        }
+        return (
+            <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                {acceptedUsers.map(user => (
+                    <img
+                        key={user.id}
+                        src={Client4.getProfilePictureUrl(user.id)}
+                        alt={getDisplayUserName(user)}
+                        title={getDisplayUserName(user)}
+                        style={{ width: 32, height: 32, borderRadius: '50%' }}
+                    />
+                ))}
+            </div>
+        );
+    };
+
+    const handleNotificationChange = async (event: React.ChangeEvent<HTMLSelectElement>) => {
+        const value = event.target.value;
+        setNotificationSetting(value);
+        setNotificationSaving(true);
+        if (selectedEvent?.event?.id) {
+            await ApiClient.setNotificationSetting(selectedEvent.event.id, value);
+        }
+        setNotificationSaving(false);
     };
 
     return (
@@ -694,7 +778,20 @@ const EventModalComponent = () => {
                                     />
                             }
 
-
+                            <div className='notification-setting-container' style={{ margin: '12px 0' }}>
+                                <label htmlFor='notification-setting-select'>Notification preference:</label>
+                                <select
+                                    id='notification-setting-select'
+                                    value={notificationSetting}
+                                    onChange={handleNotificationChange}
+                                    disabled={notificationSaving || isLoading}
+                                    style={{ marginLeft: 8 }}
+                                >
+                                    {notificationOptions.map(opt => (
+                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                    ))}
+                                </select>
+                            </div>
 
                             <div className='event-add-users-container'>
                                 <PersonAdd24Regular />
@@ -782,10 +879,18 @@ const EventModalComponent = () => {
                                 </div>
 
                             </div>
+                            {renderAcceptedAvatars()}
                             <Toaster toasterId={toasterId} />
                         </DialogContent>
                         <RemoveEventButton />
                         <DialogActions position='end'>
+                            <Button
+                                appearance={isInterested ? 'primary' : 'secondary'}
+                                onClick={onToggleInterested}
+                                style={{ marginRight: '8px' }}
+                            >
+                                {isInterested ? 'Interested ✓' : 'Interested'}
+                            </Button>
                             <DialogTrigger disableButtonEnhancement={true}>
                                 <Button
                                     appearance='secondary'
@@ -794,16 +899,14 @@ const EventModalComponent = () => {
                                     {'Close'}
                                 </Button>
                             </DialogTrigger>
-
                             <Button
                                 appearance='primary'
                                 onClick={onSaveEvent}
                                 icon={isSaving ? (<Spinner size='tiny' />) : (<Save16Regular />)}
-                                disabled={isSaving}
+                                disabled={isSaving || !canEdit}
                             >
                                 {'Save'}
                             </Button>
-
                         </DialogActions>
                     </DialogBody>
                 </DialogSurface>

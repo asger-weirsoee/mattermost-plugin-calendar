@@ -22,6 +22,7 @@ export declare type GetEventResponse = {
     team: string
     visibility: string
     alert: string
+    accepted?: string[];
 }
 
 export declare type GetEventsResponse = {
@@ -48,6 +49,11 @@ export declare type UsersScheduleResponse = {
     available_times: string[]
 }
 
+export declare type EventApiResponse = {
+    event: GetEventResponse;
+    accepted: string[];
+};
+
 export declare type ApiResponse<Type> = {
     data: Type
 }
@@ -61,7 +67,7 @@ export declare class ApiClientInterface {
 }
 
 export class ApiClient implements ApiClientInterface {
-    static async getEventById(event: string): Promise<ApiResponse<GetEventResponse>> {
+    static async getEventById(event: string): Promise<ApiResponse<EventApiResponse>> {
         const response = await fetch(
             getSiteURL() + `/plugins/${PluginId}/events/${event}`,
             Client4.getOptions({
@@ -74,15 +80,18 @@ export class ApiClient implements ApiClientInterface {
         );
         const data = await response.json();
         // eslint-disable-next-line no-negated-condition
-        if (data.data.attendees != null) {
-            if (data.data.attendees.length > 0) {
-                const users = await this.getUsersByIds(data.data.attendees);
-                data.data.attendees = users;
+        if (data.data.event.attendees != null) {
+            if (data.data.event.attendees.length > 0) {
+                const users = await this.getUsersByIds(data.data.event.attendees);
+                data.data.event.attendees = users;
             }
         } else {
-            data.data.attendees = [];
+            data.data.event.attendees = [];
         }
-
+        // Pass accepted as-is (array of user IDs)
+        if (data.data.accepted) {
+            data.data.event.accepted = data.data.accepted;
+        }
         return data;
     }
 
@@ -251,5 +260,34 @@ export class ApiClient implements ApiClientInterface {
         );
         const data = await response.json();
         return data.data;
+    }
+
+    static async getNotificationSetting(eventId: string): Promise<string | null> {
+        const response = await fetch(
+            getSiteURL() + `/plugins/${PluginId}/events/${eventId}/notification_setting`,
+            Client4.getOptions({
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+            }),
+        );
+        const data = await response.json();
+        return data.data.notification_setting ?? null;
+    }
+
+    static async setNotificationSetting(eventId: string, notificationSetting: string): Promise<boolean> {
+        const response = await fetch(
+            getSiteURL() + `/plugins/${PluginId}/events/${eventId}/notification_setting`,
+            Client4.getOptions({
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ notification_setting: notificationSetting }),
+            }),
+        );
+        const data = await response.json();
+        return data.data.success === true;
     }
 }
